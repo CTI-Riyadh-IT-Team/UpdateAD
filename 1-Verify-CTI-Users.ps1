@@ -1,22 +1,31 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 #requires -Modules ActiveDirectory
 
 $ErrorActionPreference = "Stop"
 
+# Better UTF-8 output for Arabic names in Windows PowerShell console
+try { chcp 65001 > $null } catch {}
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
+
 # ============================================================
-# CTI Active Directory bulk users
+# CTI - VERIFY users.xlsx ONLY
 #
-# users.xlsx must be in the SAME folder as this script.
+# Purpose:
+# - Validate that the NEW Excel data is complete and usable.
+# - Existing users INSIDE the students OU are NOT an error,
+#   because step 2 deletes them before step 3 imports fresh users.
+# - A collision OUTSIDE the students OU IS an error because it
+#   will remain after the students OU is cleared.
 #
-# Excel mapping:
-# A = Email
-# B = English Name          -> Name / CN
-# C = Arabic Name           -> DisplayName
-# D = Password
-# E = Training Number       -> sAMAccountName
-#                             UserPrincipalName = E@cti.org
+# Excel:
+# A = Email                    REQUIRED
+# B = English Name / CN        REQUIRED
+# C = Arabic DisplayName       REQUIRED
+# D = Password                 REQUIRED
+# E = Training Number/Username REQUIRED
 #
-# Target OU:
+# Target:
 # OU=students,OU=Users,OU=Saudis,OU=CTI,DC=cti,DC=org
 # ============================================================
 
@@ -24,6 +33,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ExcelPath = Join-Path $ScriptDir "users.xlsx"
 $TargetOU  = "OU=students,OU=Users,OU=Saudis,OU=CTI,DC=cti,DC=org"
 $UPNSuffix = "cti.org"
+$ReportPath = Join-Path $ScriptDir ("VERIFY-AD-Users-{0}.csv" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 
 function Write-Status {
     param(
@@ -38,11 +48,9 @@ function Get-ColumnNumber {
 
     $letters = ($CellReference -replace '[^A-Za-z]', '').ToUpperInvariant()
     $number = 0
-
     foreach ($ch in $letters.ToCharArray()) {
         $number = ($number * 26) + ([int][char]$ch - [int][char]'A' + 1)
     }
-
     return $number
 }
 
@@ -58,12 +66,8 @@ function Get-ZipEntryXml {
     $stream = $entry.Open()
     try {
         $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true)
-        try {
-            $text = $reader.ReadToEnd()
-        }
-        finally {
-            $reader.Dispose()
-        }
+        try { $text = $reader.ReadToEnd() }
+        finally { $reader.Dispose() }
 
         $xml = New-Object System.Xml.XmlDocument
         $xml.PreserveWhitespace = $false
@@ -173,16 +177,12 @@ function Get-ExcelRows {
                                 if ([int]::TryParse($raw, [ref]$idx) -and $idx -ge 0 -and $idx -lt $sharedStrings.Count) {
                                     $value = [string]$sharedStrings[$idx]
                                 }
-                                else {
-                                    $value = $raw
-                                }
+                                else { $value = $raw }
                             }
                             "b" {
                                 if ($raw -eq "1") { $value = "TRUE" } else { $value = "FALSE" }
                             }
-                            default {
-                                $value = $raw
-                            }
+                            default { $value = $raw }
                         }
                     }
                 }
@@ -237,6 +237,7 @@ function Get-PreparedRows {
             [string]::IsNullOrWhiteSpace($password) -and
             [string]::IsNullOrWhiteSpace($username)
         )
+
         if ($isEmpty) { continue }
 
         if ($firstNonEmpty) {
@@ -258,6 +259,17 @@ function Get-PreparedRows {
     return $prepared
 }
 
+function Test-IsInsideTargetOU {
+    param([string]$DistinguishedName)
+
+    if ([string]::IsNullOrWhiteSpace($DistinguishedName)) { return $false }
+
+    return $DistinguishedName.EndsWith(
+        "," + $TargetOU,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
 function Test-PasswordApprox {
     param(
         [string]$Password,
@@ -269,33 +281,32 @@ function Test-PasswordApprox {
     $problems = New-Object System.Collections.Generic.List[string]
 
     if ([string]::IsNullOrWhiteSpace($Password)) {
-        $problems.Add("Password is empty")
+        $problems.Add("D: Password is empty")
         return $problems
     }
 
-    if ($Policy -and $Password.Length -lt [int]$Policy.MinPasswordLength) {
-        $problems.Add("Password is shorter than domain minimum length ($($Policy.MinPasswordLength))")
+    if ($Password.Length -lt [int]$Policy.MinPasswordLength) {
+        $problems.Add("D: Password is shorter than the domain minimum ($($Policy.MinPasswordLength))")
     }
 
-    if ($Policy -and $Policy.ComplexityEnabled) {
+    if ($Policy.ComplexityEnabled) {
         $classes = 0
         if ($Password -cmatch '[A-Z]') { $classes++ }
         if ($Password -cmatch '[a-z]') { $classes++ }
         if ($Password -match '\d') { $classes++ }
         if ($Password -match '[^A-Za-z0-9]') { $classes++ }
 
-        # Windows complexity also has additional rules. This is a safe pre-check.
         if ($classes -lt 3) {
-            $problems.Add("Password may fail domain complexity requirements")
+            $problems.Add("D: Password may fail the domain complexity policy")
         }
 
         if ($Username.Length -ge 3 -and $Password.ToLowerInvariant().Contains($Username.ToLowerInvariant())) {
-            $problems.Add("Password contains the username")
+            $problems.Add("D: Password contains the username")
         }
 
         foreach ($part in ($EnglishName -split '[\s,._-]+' | Where-Object { $_.Length -ge 3 })) {
             if ($Password.ToLowerInvariant().Contains($part.ToLowerInvariant())) {
-                $problems.Add("Password contains part of the user's name: $part")
+                $problems.Add("D: Password contains part of the English name: $part")
                 break
             }
         }
@@ -304,134 +315,153 @@ function Test-PasswordApprox {
     return $problems
 }
 
-function Initialize-Environment {
+Write-Host ""
+Write-Status "============================================================" Cyan
+Write-Status " CTI USERS - VERIFY NEW EXCEL DATA ONLY" Cyan
+Write-Status "============================================================" Cyan
+Write-Host ""
+
+try {
     if (-not (Test-Path -LiteralPath $ExcelPath)) {
         throw "users.xlsx was not found beside the script: $ExcelPath"
     }
 
     Import-Module ActiveDirectory -ErrorAction Stop
+
     $domain = Get-ADDomain -Identity "cti.org" -ErrorAction Stop
-    $null = Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction Stop
+    $ou = Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction Stop
     $policy = Get-ADDefaultDomainPasswordPolicy -Identity "cti.org" -ErrorAction Stop
 
-    return [pscustomobject]@{
-        Domain = $domain
-        Policy = $policy
-    }
-}
-
-function Test-UserRow {
-    param(
-        $User,
-        [object[]]$AllPreparedRows,
-        $Policy
-    )
-
-    $issues = New-Object System.Collections.Generic.List[string]
-
-    if ([string]::IsNullOrWhiteSpace($User.EnglishName)) { $issues.Add("B: English Name is empty") }
-    if ([string]::IsNullOrWhiteSpace($User.DisplayName)) { $issues.Add("C: Display Name is empty") }
-    if ([string]::IsNullOrWhiteSpace($User.Password))    { $issues.Add("D: Password is empty") }
-    if ([string]::IsNullOrWhiteSpace($User.Username))    { $issues.Add("E: Username/Training Number is empty") }
-
-    if (-not [string]::IsNullOrWhiteSpace($User.Email) -and $User.Email -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
-        $issues.Add("A: Email format is invalid")
+    if ($domain.DNSRoot -ne "cti.org") {
+        throw "Connected domain is not cti.org."
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($User.Username)) {
-        if ($User.Username.Length -gt 20) {
-            $issues.Add("E: sAMAccountName is longer than 20 characters")
-        }
-
-        if ($User.Username -match '[\"/\\\[\]:;|=,\+\*\?<>\s]') {
-            $issues.Add("E: Username contains a character not suitable for sAMAccountName")
-        }
-
-        $dupUserRows = @($AllPreparedRows | Where-Object { $_.Username -eq $User.Username })
-        if ($dupUserRows.Count -gt 1) {
-            $issues.Add("Duplicate username inside users.xlsx")
-        }
-
-        $safeUsername = $User.Username.Replace("'", "''")
-        if (Get-ADUser -Filter "SamAccountName -eq '$safeUsername'" -ErrorAction Stop) {
-            $issues.Add("Username already exists in Active Directory")
-        }
-
-        $safeUPN = $User.UPN.Replace("'", "''")
-        if (Get-ADUser -Filter "UserPrincipalName -eq '$safeUPN'" -ErrorAction Stop) {
-            $issues.Add("UPN already exists in Active Directory")
-        }
+    if ($ou.DistinguishedName -ne $TargetOU) {
+        throw "The resolved OU is not the configured students OU."
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($User.EnglishName)) {
-        $dupNameRows = @($AllPreparedRows | Where-Object { $_.EnglishName -eq $User.EnglishName })
-        if ($dupNameRows.Count -gt 1) {
-            $issues.Add("Duplicate English Name/CN inside users.xlsx")
-        }
-
-        $escapedName = $User.EnglishName.Replace("'", "''")
-        if (Get-ADUser -SearchBase $TargetOU -SearchScope OneLevel -Filter "Name -eq '$escapedName'" -ErrorAction Stop) {
-            $issues.Add("A user with the same Name/CN already exists in the target OU")
-        }
-    }
-
-    foreach ($p in (Test-PasswordApprox -Password $User.Password -Username $User.Username -EnglishName $User.EnglishName -Policy $Policy)) {
-        $issues.Add($p)
-    }
-
-    return $issues
-}
-
-# ============================================================
-# VERIFY ONLY - NO AD CHANGES
-# ============================================================
-
-$ReportPath = Join-Path $ScriptDir ("VERIFY-AD-Users-{0}.csv" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
-
-Write-Host ""
-Write-Status "============================================================" Cyan
-Write-Status " CTI USERS - VERIFY ONLY (NO CHANGES)" Cyan
-Write-Status "============================================================" Cyan
-Write-Host ""
-
-try {
-    $envInfo = Initialize-Environment
     $rawRows = @(Get-ExcelRows -Path $ExcelPath)
     $users = @(Get-PreparedRows -Rows $rawRows)
 }
 catch {
     Write-Status "FATAL: $($_.Exception.Message)" Red
-    Read-Host "Press Enter to exit"
-    exit 1
+    exit 10
 }
 
-Write-Status "Domain    : $($envInfo.Domain.DNSRoot)" DarkCyan
+if ($users.Count -eq 0) {
+    Write-Status "FAIL: users.xlsx contains no student rows." Red
+    exit 11
+}
+
+Write-Status "Domain    : $($domain.DNSRoot)" DarkCyan
 Write-Status "Target OU : $TargetOU" DarkCyan
 Write-Status "Excel     : $ExcelPath" DarkCyan
-Write-Status "Mode      : VERIFY ONLY - nothing will be created or changed" Yellow
+Write-Status "Students  : $($users.Count)" DarkCyan
 Write-Host ""
 
 $results = New-Object System.Collections.Generic.List[object]
-$valid = 0
-$invalid = 0
+$ready = 0
+$failed = 0
+$existingInsideOU = 0
 
 foreach ($user in $users) {
-    $issues = @(Test-UserRow -User $user -AllPreparedRows $users -Policy $envInfo.Policy)
+    $issues = New-Object System.Collections.Generic.List[string]
+    $notes  = New-Object System.Collections.Generic.List[string]
+
+    # A-E are all required
+    if ([string]::IsNullOrWhiteSpace($user.Email))       { $issues.Add("A: Email is empty") }
+    if ([string]::IsNullOrWhiteSpace($user.EnglishName)) { $issues.Add("B: English Name is empty") }
+    if ([string]::IsNullOrWhiteSpace($user.DisplayName)) { $issues.Add("C: Arabic DisplayName is empty") }
+    if ([string]::IsNullOrWhiteSpace($user.Password))    { $issues.Add("D: Password is empty") }
+    if ([string]::IsNullOrWhiteSpace($user.Username))    { $issues.Add("E: Username/Training Number is empty") }
+
+    # Email format
+    if (-not [string]::IsNullOrWhiteSpace($user.Email) -and
+        $user.Email -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        $issues.Add("A: Email format is invalid")
+    }
+
+    # Username validation
+    if (-not [string]::IsNullOrWhiteSpace($user.Username)) {
+        if ($user.Username.Length -gt 20) {
+            $issues.Add("E: Username is longer than 20 characters")
+        }
+
+        if ($user.Username -match '[\"/\\\[\]:;|=,\+\*\?<>\s]') {
+            $issues.Add("E: Username contains invalid characters")
+        }
+
+        # Duplicate username inside the NEW Excel file
+        if (@($users | Where-Object { $_.Username -eq $user.Username }).Count -gt 1) {
+            $issues.Add("E: Duplicate username inside users.xlsx")
+        }
+
+        # Existing account check:
+        # - inside students OU = OK; step 2 will delete it
+        # - outside students OU = FAIL
+        $safeUsername = $user.Username.Replace("'", "''")
+        $existingBySam = @(
+            Get-ADUser `
+                -Filter "SamAccountName -eq '$safeUsername'" `
+                -Properties DistinguishedName `
+                -ErrorAction Stop
+        )
+
+        foreach ($existing in $existingBySam) {
+            if (Test-IsInsideTargetOU -DistinguishedName $existing.DistinguishedName) {
+                $notes.Add("Existing account in students OU - OK, it will be deleted in step 2")
+                $existingInsideOU++
+            }
+            else {
+                $issues.Add("Username already exists OUTSIDE students OU: $($existing.DistinguishedName)")
+            }
+        }
+
+        $safeUPN = $user.UPN.Replace("'", "''")
+        $existingByUPN = @(
+            Get-ADUser `
+                -Filter "UserPrincipalName -eq '$safeUPN'" `
+                -Properties DistinguishedName `
+                -ErrorAction Stop
+        )
+
+        foreach ($existing in $existingByUPN) {
+            if (-not (Test-IsInsideTargetOU -DistinguishedName $existing.DistinguishedName)) {
+                $issues.Add("UPN already exists OUTSIDE students OU: $($existing.DistinguishedName)")
+            }
+        }
+    }
+
+    # Same CN/Name cannot be repeated in the same OU after import
+    if (-not [string]::IsNullOrWhiteSpace($user.EnglishName)) {
+        if (@($users | Where-Object { $_.EnglishName -eq $user.EnglishName }).Count -gt 1) {
+            $issues.Add("B: Duplicate English Name/CN inside users.xlsx")
+        }
+    }
+
+    # Password pre-check
+    foreach ($p in (Test-PasswordApprox `
+        -Password $user.Password `
+        -Username $user.Username `
+        -EnglishName $user.EnglishName `
+        -Policy $policy)) {
+        $issues.Add($p)
+    }
 
     if ($issues.Count -eq 0) {
-        Write-Status "[$($user.ExcelRow)] OK  $($user.Username) | $($user.DisplayName)" Green
-        $valid++
+        Write-Status "[$($user.ExcelRow)] OK    $($user.Username) | $($user.DisplayName)" Green
+        $ready++
         $status = "READY"
-        $message = "Ready to import"
+        $message = if ($notes.Count -gt 0) { $notes -join " | " } else { "Ready" }
     }
     else {
         Write-Status "[$($user.ExcelRow)] FAIL  $($user.Username) | $($user.DisplayName)" Red
         foreach ($issue in $issues) {
             Write-Status "    - $issue" Yellow
         }
-        $invalid++
+        $failed++
         $status = "FAILED"
-        $message = ($issues -join " | ")
+        $message = $issues -join " | "
     }
 
     $results.Add([pscustomobject]@{
@@ -450,22 +480,17 @@ $results | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
 
 Write-Host ""
 Write-Status "============================================================" Cyan
-Write-Status " VERIFY FINISHED - NO CHANGES WERE MADE" Cyan
+Write-Status " VERIFY FINISHED - NO AD CHANGES WERE MADE" Cyan
 Write-Status "============================================================" Cyan
-Write-Status "Ready  : $valid" Green
-Write-Status "Failed : $invalid" Red
+Write-Status "Ready  : $ready" Green
+Write-Status "Failed : $failed" Red
 Write-Status "Report : $ReportPath" DarkCyan
 Write-Host ""
 
-if ($invalid -eq 0 -and $valid -gt 0) {
-    Write-Status "RESULT: PASS - file is ready for the import script." Green
-}
-elseif ($valid -eq 0) {
-    Write-Status "RESULT: FAIL - no valid users found." Red
-}
-else {
-    Write-Status "RESULT: FAIL - fix the failed rows before importing." Red
+if ($failed -gt 0) {
+    Write-Status "RESULT: FAIL - fix the Excel data before delete/import." Red
+    exit 20
 }
 
-Write-Host ""
-Read-Host "Press Enter to exit"
+Write-Status "RESULT: PASS - Excel data is ready for delete -> import." Green
+exit 0
