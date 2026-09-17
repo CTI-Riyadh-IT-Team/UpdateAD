@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -38,26 +38,15 @@ foreach ($required in @($VerifyScript, $DeleteScript, $ImportScript, $ExcelPath)
     }
 }
 
-function Invoke-Step {
-    param(
-        [string]$Title,
-        [string]$Path
-    )
+# STEP 1
+Write-Host ""
+Write-Status "----------------------------------------------------------------" DarkGray
+Write-Status "STEP 1: VERIFY" Cyan
+Write-Status "----------------------------------------------------------------" DarkGray
 
-    Write-Host ""
-    Write-Status "----------------------------------------------------------------" DarkGray
-    Write-Status $Title Cyan
-    Write-Status "----------------------------------------------------------------" DarkGray
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $VerifyScript
+$verifyCode = $LASTEXITCODE
 
-    & powershell.exe `
-        -NoProfile `
-        -ExecutionPolicy Bypass `
-        -File $Path
-
-    return $LASTEXITCODE
-}
-
-$verifyCode = Invoke-Step -Title "STEP 1: VERIFY" -Path $VerifyScript
 if ($verifyCode -ne 0) {
     Write-Host ""
     Write-Status "WORKFLOW STOPPED: verification failed (exit code $verifyCode)." Red
@@ -66,6 +55,7 @@ if ($verifyCode -ne 0) {
     exit $verifyCode
 }
 
+# STEP 2
 Write-Host ""
 Write-Status "Verification PASSED." Green
 Write-Status "WARNING: the next step permanently deletes existing student user objects." Yellow
@@ -74,7 +64,14 @@ Write-Host ""
 Write-Status "Starting deletion automatically in 5 seconds. Press Ctrl+C now to cancel." Yellow
 Start-Sleep -Seconds 5
 
-$deleteCode = Invoke-Step -Title "STEP 2: DELETE EXISTING STUDENT USERS" -Path $DeleteScript
+Write-Host ""
+Write-Status "----------------------------------------------------------------" DarkGray
+Write-Status "STEP 2: DELETE EXISTING STUDENT USERS" Cyan
+Write-Status "----------------------------------------------------------------" DarkGray
+
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $DeleteScript
+$deleteCode = $LASTEXITCODE
+
 if ($deleteCode -ne 0) {
     Write-Host ""
     Write-Status "WORKFLOW STOPPED: deletion failed (exit code $deleteCode)." Red
@@ -83,7 +80,15 @@ if ($deleteCode -ne 0) {
     exit $deleteCode
 }
 
-$importCode = Invoke-Step -Title "STEP 3: IMPORT FRESH USERS" -Path $ImportScript
+# STEP 3
+Write-Host ""
+Write-Status "----------------------------------------------------------------" DarkGray
+Write-Status "STEP 3: IMPORT FRESH USERS" Cyan
+Write-Status "----------------------------------------------------------------" DarkGray
+
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ImportScript
+$importCode = $LASTEXITCODE
+
 if ($importCode -ne 0) {
     Write-Host ""
     Write-Status "WORKFLOW FINISHED WITH ERROR: import failed (exit code $importCode)." Red
